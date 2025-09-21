@@ -1,0 +1,341 @@
+---
+title: "Survival Analysis"
+author: "Caio Vallio"
+abstract: "A survival analysis of a synthetic dataset"
+date: last-modified
+format: 
+  html:
+    self-contained: true
+    df-print: paged
+    toc: true 
+    toc-depth: 5
+    number-sections: true
+    number-depth: 5
+    code-fold: show
+    code-tools: true
+    code-line-numbers: true
+execute: 
+  echo: true
+  warning: false
+lang: en
+# bibliography: bibliografia.bib
+---
+
+```{r setup, include=FALSE}
+# Carregar pacotes necessários
+library(dplyr)
+library(lubridate)
+library(survival)
+library(survminer)
+library(broom)
+```
+
+# Introdução
+
+Neste documento será realizado um estudo de sobrevivência com o dataset df_sint, para:    
+
+- Estimar a distribuição de tempo até o evento de interesse (evento / censura);  
+- Comparar funções de sobrevivência entre grupos (tratamento, sexo, etc.);  
+- Ajustar modelos multivariados para identificar efeitos de covariáveis;  
+- Verificar pressupostos (principalmente o da proporcionalidade de riscos);  
+- Avaliar modelos alternativos caso algum pressuposto seja violado;  
+- Oferecer interpretações estatísticas rigorosas dos resultados.      
+
+---
+
+# Carregamento dos dados
+
+```{r}
+df_sint <- read.csv("data/df_sint.csv", stringsAsFactors = FALSE)
+
+# Visualizar estrutura dos dados
+skimr::skim(df_sint)
+```
+
+
+**Interpretação esperada desta etapa**   
+
+- Verificar que todos os registros têm tempo >= 0.  
+- Verificar contagem de eventos vs censuras.  
+- Verificar estrutura de covariáveis: idade (distribuição), categorias de sexo, tratamento, possíveis outliers.  
+
+---
+
+# Análise descritiva
+
+```{r}
+df_sint %>%
+    summarise(
+        n = n(),
+        eventos = sum(status),
+        censurados = sum(1 - status),
+        prop_eventos = mean(status),
+        media_tempo = mean(tempo),
+        mediana_tempo = median(tempo),
+        min_tempo = min(tempo),
+        max_tempo = max(tempo)
+    )
+
+df_sint %>%
+    group_by(tratamento) %>%
+    summarise(
+        n = n(),
+        eventos = sum(status),
+        prop_eventos = mean(status),
+        mediana_tempo = median(tempo)
+    )
+
+df_sint %>%
+    group_by(sexo) %>%
+    summarise(
+        n = n(),
+        eventos = sum(status),
+        prop_eventos = mean(status),
+        mediana_tempo = median(tempo)
+    )
+```
+
+**Interpretação esperada**    
+
+- Qual a proporção de sujeitos que tiveram evento vs censurados (“status = 1” vs “0”).    
+- Mediana de tempo de seguimento geral, e por grupo.    
+- Verificar se distribuição de idade tem variabilidade, possíveis outliers.    
+- Verificar número de indivíduos por grupo de tratamento e sexo para garantir poder suficiente.    
+
+---
+
+# Estimativa de Kaplan–Meier (KM)
+
+## Curva de sobrevivência geral
+
+```{r}
+surv_obj <- Surv(time = df_sint$tempo, event = df_sint$status)
+km_fit <- survfit(surv_obj ~ 1, data = df_sint)
+
+ggsurvplot(
+    km_fit,
+    conf.int = TRUE,
+    risk.table = TRUE,
+    xlab = "Tempo (dias)",
+    ylab = "Probabilidade de sobrevivência",
+    title = "Curva KM geral para df_sint"
+)
+```
+
+**Interpretação esperada**   
+
+- A curva inicia em 1 (100%) em tempo zero.    
+- Em tempos intermediários, queda na sobrevivência conforme ocorrem eventos.    
+- A curva de confiança mostra incerteza, que geralmente aumenta em tempos mais avançados (porque menos sujeitos em risco).    
+- Tabela de risco mostra quantos indivíduos ainda sob observação (“em risco”) ao longo do tempo.    
+
+
+## Curvas de sobrevivência por grupo (tratamento, sexo)
+
+```{r}
+km_trat <- survfit(surv_obj ~ tratamento, data = df_sint)
+ggsurvplot(
+    km_trat,
+    conf.int = TRUE,
+    pval = TRUE,
+    risk.table = TRUE,
+    legend.title = "Tratamento",
+    xlab = "Tempo (dias)",
+    ylab = "Sobrevivência",
+    title = "KM por Tratamento"
+)
+```
+
+```{r}
+km_sexo <- survfit(surv_obj ~ sexo, data = df_sint)
+ggsurvplot(
+    km_sexo,
+    conf.int = TRUE,
+    pval = TRUE,
+    risk.table = TRUE,
+    legend.title = "Sexo",
+    xlab = "Tempo (dias)",
+    ylab = "Sobrevivência",
+    title = "KM por Sexo"
+)
+```
+
+**Interpretação esperada**  
+
+- Se as curvas de tratamento A e B divergem, pode haver efeito do tratamento. Observações visuais: diferenças iniciais, diferenças tardias.    
+- P-valor do teste de log-rank indica se a diferença entre curvas é estatisticamente significativa.    
+- Atenção à censura desigual nos grupos: se um grupo tiver muitos censurados cedo, pode influenciar visualização.    
+
+---
+
+# Teste de log-rank
+
+```{r}
+survdiff(surv_obj ~ tratamento, data = df_sint)
+survdiff(surv_obj ~ sexo, data = df_sint)
+```
+
+**Interpretação esperada**   
+
+- O teste de log-rank testa a hipótese nula de que as curvas de sobrevivência dos grupos são iguais ao longo do tempo.     
+- Se p < 0.05, rejeita-se essa hipótese.     
+- Mas o teste assume proporcionalidade de riscos entre os grupos; se violado, os resultados podem ser enganosos. (Ver seção de pressupostos abaixo).   
+
+---
+
+## Modelo de Cox Proporcional de Riscos
+
+```{r}
+cox_mod <- coxph(surv_obj ~ idade + sexo + tratamento, data = df_sint)
+summary(cox_mod)
+```
+
+**Interpretação dos resultados do summary(cox_mod)**
+
+| Output | O que representa |
+|--------|------------------|
+| Coeficiente β para cada covariável | Log do hazard ratio para uma unidade da covariável (ou comparação de categoria)
+| exp(coef) | Hazard Ratio (HR): efeito multiplicativo no risco
+| erro padrão (se(coef)) | Incerteza do estimador da β
+| z e valor-p | Teste de hipótese H₀: β = 0 (ou HR = 1)
+| Intervalo de confiança de 95% para HR | Se não incluir 1 ⇒ efeito “significativo” ao nível de 5%
+| Estatísticas de verossimilhança, AIC | Para comparar modelos (se fizer mais de um)
+
+
+---
+
+# Pressupostos do modelo de Cox e testes diagnósticos
+
+Aqui são os principais pressupostos, como testá-los, e o que fazer se forem violados.
+
+## Pressupostos importantes
+
+**1. Riscos proporcionais (Proportional Hazards, PH)**    
+
+O hazard ratio entre níveis de covariáveis (ex: tratamento A vs B) deve permanecer constante ao longo do tempo.
+
+**2. Censura não informativa (independent / random censoring)**    
+
+A censura deve ocorrer de forma que não esteja relacionada com a probabilidade de ter o evento.
+
+**3. Independência entre observações**    
+
+Cada indivíduo deve ser independente; se houver estrutura de agrupamento pode ser necessário usar modelos de frailty ou incluir variáveis de cluster.
+
+**4. Linearidade para covariáveis contínuas no termo do log-hazard**   
+
+Efeitos das variáveis contínuas devem ser lineares no log-hazard. Se não for, considerar transformações ou splines.
+
+**5. Covariáveis constantes no tempo**, ou modelagem apropriada se variáveis mudam ao longo do tempo.  
+
+## Teste da proporcionalidade de riscos
+
+```{r}
+zph_res <- cox.zph(cox_mod)
+zph_res
+plot(zph_res)
+ggcoxzph(zph_res)
+```
+
+- cox.zph() retorna testes estatísticos (baseado nos resíduos de Schoenfeld) para cada covariável e um teste global.    
+- Um p valor < 0.05 sugere violação da proporcionalidade para aquela covariável.     
+- Os gráficos de resíduos escalonados de Schoenfeld permitem visualizar se há tendência de variação do β ao longo do tempo (linha de tendência não horizontal indica suspeita de violação).    
+
+## Outras verificações diagnósticas
+
+- Resíduos de Martingale: para verificar forma funcional de covariáveis contínuas (linearidade). Se padrão sistemático no gráfico do resíduo vs valor da covariável, pode indicar necessidade de transformação ou de usar termos não-lineares/splines.     
+- Resíduos de deviance ou deviance residuals: para detectar influências ou observações atípicas.    
+
+---
+
+# Ações se algum pressuposto for violado
+```{r}
+# Exemplo 1: estratificação por covariável que viola proporcionalidade
+cox_mod_strata <- coxph(surv_obj ~ idade + sexo + strata(tratamento), data = df_sint)
+summary(cox_mod_strata)
+
+# Exemplo 2: incluir efeito dependente do tempo
+# Suponha tratamento violou, então:
+df_sint$tratB <- as.numeric(df_sint$tratamento == "B")
+
+cox_mod_td <- coxph(
+    surv_obj ~ idade + sexo + tratB + tt(tratB),
+    data = df_sint,
+    tt = function(x, t, ...) x * log(t + 1)
+)
+
+summary(cox_mod_td)
+# alternativa: tt() serviço do survival para interações com tempo
+```
+
+
+- Estratificação: a variável que violou é usada como strata(...), assim não se estima coeficiente para ela, mas permite que a base‐hazard varie por estrato.    
+- Interação com tempo / coeficientes dependentes do tempo: modelar β_j(t) para aquela covariável.    
+- Modelos paramétricos ou de intervalo de tempo: ex: modelo Weibull, Log-normal, ou dividir seguimento em pedaços de tempo onde PH pode valer.
+
+---
+
+# Modelos paramétricos alternativos
+
+```{r}
+# Diagnóstico
+# summary(df_sint$tempo)
+# table(df_sint$tempo == 0, useNA = "ifany")
+
+# Remover registros inválidos (negativos) e ajustar zeros
+df_sint_fix <- df_sint |>
+    filter(!is.na(tempo) & tempo >= 0) |>
+    mutate(tempo_aft = ifelse(tempo <= 0, 0.5, tempo)) # meia-dia mínimo (ajuste prático)
+
+# Verifique de novo
+# summary(df_sint_fix$tempo_aft)
+
+# AFT Weibull / Log-normal
+weibull_mod <- survreg(Surv(tempo_aft, status) ~ idade + sexo + tratamento,
+    data = df_sint_fix, dist = "weibull"
+)
+
+lognormal_mod <- survreg(Surv(tempo_aft, status) ~ idade + sexo + tratamento,
+    data = df_sint_fix, dist = "lognormal"
+)
+
+summary(weibull_mod)
+summary(lognormal_mod)
+```
+
+
+**Interpretação**
+
+- O survreg fornece estimativas em escala de log‐tempo etc.; os coeficientes não são hazard ratios diretamente, mas podem ser convertidos ou interpretados conforme a escala acelerada‐“time” (AFT: Accelerated Failure Time).     
+- Comparar AIC ou critério similar entre modelos (Cox vs Weibull vs Lognormal) para ver qual modelo parece se ajustar melhor aos seus dados.    
+- Se modelo paramétrico ajustar bem, pode oferecer estimativas diretas de quantis de tempo de sobrevivência (medianas, percentis) e prever tempos de sobrevivência para perfis de covariáveis.   
+
+> Em AFT, os coeficientes estão na escala do log-tempo; não são HR direto. Converta/relate corretamente na interpretação (p. ex., tempo “acelerado” ou “desacelerado” por um fator ao exponentiar).
+
+---
+
+# Visualizações finais e resumo de resultados
+
+```{r}
+ggforest(cox_mod, data = df_sint)
+
+tidy(cox_mod, exponentiate = TRUE, conf.int = TRUE)
+```
+
+**O que reportar no texto:**
+
+- Hazard Ratios estimados, seus intervalos de confiança, e quais covariáveis tiveram efeitos estatisticamente significativos.     
+- Mediana de sobrevivência se estimada e tempos de sobrevivência em pontos de interesse.     
+- Se houver violação de proporcionalidade, descrição do que foi feito (estratificação, interação, uso de modelo alternativo).     
+- Limitações: censura, tamanho de amostra, observações extremas, covariáveis não medidas ou tempo‐dependentes, supostos não verificáveis (e.g. censura não informativa).    
+
+---
+
+# Conclusão
+
+Aqui você vai sintetizar:
+
+- Principais achados: quais covariáveis estão associadas com maior risco, qual o efeito estimado do tratamento, idade etc.     
+- Qualidade do ajuste: se pressupostos atendidos ou violados, como isso pode afetar interpretação.     
+- Sugestões para análises futuras ou melhorias (por exemplo, coleta de variáveis tempo‐dependentes, usar modelos de riscos competitivos, validação externa).    
+
